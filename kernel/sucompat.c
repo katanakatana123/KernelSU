@@ -14,6 +14,9 @@
 #else
 #include <linux/sched.h>
 #endif
+#ifdef CONFIG_KSU_SUSFS_SUS_SU
+#include <linux/susfs_def.h>
+#endif
 
 #include "objsec.h"
 #include "allowlist.h"
@@ -27,7 +30,7 @@
 
 static const char su[] = SU_PATH;
 
-extern void escape_to_root();
+extern void ksu_escape_to_root();
 
 bool ksu_sucompat_hook_state __read_mostly = true;
 
@@ -61,12 +64,17 @@ int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode,
 	}
 #endif
 
+#ifndef CONFIG_KSU_SUSFS_SUS_SU
 	if (!ksu_is_allow_uid(current_uid().val)) {
 		return 0;
 	}
-
+#endif
+#ifdef CONFIG_KSU_SUSFS_SUS_SU
+	char path[sizeof(su) + 1] = {0};
+#else
 	char path[sizeof(su) + 1];
 	memset(path, 0, sizeof(path));
+#endif
 	ksu_strncpy_from_user_nofault(path, *filename_user, sizeof(path));
 
 	if (unlikely(!memcmp(path, su, sizeof(su)))) {
@@ -77,6 +85,25 @@ int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode,
 	return 0;
 }
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0) && defined(CONFIG_KSU_SUSFS_SUS_SU)
+struct filename* susfs_ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags) {
+	struct filename *name = getname_flags(*filename_user, getname_statx_lookup_flags(*flags), NULL);
+
+	if (unlikely(IS_ERR(name) || name->name == NULL)) {
+		return name;
+	}
+
+	if (likely(memcmp(name->name, su, sizeof(su)))) {
+		return name;
+	}
+
+	const char sh[] = SH_PATH;
+	pr_info("vfs_fstatat su->sh!\n");
+	memcpy((void *)name->name, sh, sizeof(sh));
+	return name;
+}
+#endif
+
 int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags)
 {
 #ifndef CONFIG_KSU_KPROBES_HOOK
@@ -85,16 +112,22 @@ int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags)
 	}
 #endif
 
+#ifndef CONFIG_KSU_SUSFS_SUS_SU
 	if (!ksu_is_allow_uid(current_uid().val)) {
 		return 0;
 	}
+#endif
 
 	if (unlikely(!filename_user)) {
 		return 0;
 	}
 
+#ifdef CONFIG_KSU_SUSFS_SUS_SU
+	char path[sizeof(su) + 1] = {0};
+#else
 	char path[sizeof(su) + 1];
 	memset(path, 0, sizeof(path));
+#endif
 
 	ksu_strncpy_from_user_nofault(path, *filename_user, sizeof(path));
 
@@ -130,13 +163,15 @@ int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,
 	if (likely(memcmp(filename->name, su, sizeof(su))))
 		return 0;
 
+#ifndef CONFIG_KSU_SUSFS_SUS_SU
 	if (!ksu_is_allow_uid(current_uid().val))
 		return 0;
+#endif
 
 	pr_info("do_execveat_common su found\n");
-	memcpy((void *)filename->name, sh, sizeof(sh));
+	memcpy((void *)filename->name, ksud_path, sizeof(ksud_path));
 
-	escape_to_root();
+	ksu_escape_to_root();
 
 	return 0;
 }
@@ -145,11 +180,16 @@ int ksu_handle_execve_sucompat(int *fd, const char __user **filename_user,
 			       void *__never_use_argv, void *__never_use_envp,
 			       int *__never_use_flags)
 {
+#ifdef CONFIG_KSU_SUSFS_SUS_SU
+	char path[sizeof(su) + 1] = {0};
+#else
 	char path[sizeof(su) + 1];
+#endif
 
 	if (unlikely(!filename_user))
 		return 0;
 
+#ifndef CONFIG_KSU_SUSFS
 	/*
 	 * nofault variant fails silently due to pagefault_disable
 	 * some cpus dont really have that good speculative execution
@@ -165,6 +205,12 @@ int ksu_handle_execve_sucompat(int *fd, const char __user **filename_user,
 
 	// strncpy_from_user_nofault does this too
 	path[sizeof(path) - 1] = '\0';
+#else
+#ifndef CONFIG_KSU_SUSFS_SUS_SU
+ 	memset(path, 0, sizeof(path));
+#endif
+ 	ksu_strncpy_from_user_nofault(path, *filename_user, sizeof(path));
+#endif
 
 	if (likely(memcmp(path, su, sizeof(su))))
 		return 0;
@@ -175,7 +221,7 @@ int ksu_handle_execve_sucompat(int *fd, const char __user **filename_user,
 	pr_info("sys_execve su found\n");
 	*filename_user = ksud_user_path();
 
-	escape_to_root();
+	ksu_escape_to_root();
 
 	return 0;
 }
@@ -339,3 +385,42 @@ void ksu_sucompat_exit()
 	pr_info("ksu_sucompat exit\n");
 #endif
 }
+
+#ifdef CONFIG_KSU_SUSFS_SUS_SU
+extern bool ksu_su_compat_enabled;
+bool ksu_devpts_hook = false;
+bool susfs_is_sus_su_hooks_enabled __read_mostly = false;
+int susfs_sus_su_working_mode = 0;
+
+static bool ksu_is_su_kps_enabled(void) {
+	int i;
+	for (i = 0; i < ARRAY_SIZE(su_kps); i++) {
+		if (su_kps[i]) {
+			return true;
+		}
+	}
+	return false;
+}
+
+void ksu_susfs_disable_sus_su(void) {
+	susfs_is_sus_su_hooks_enabled = false;
+	ksu_devpts_hook = false;
+	susfs_sus_su_working_mode = SUS_SU_DISABLED;
+	// Re-enable the su_kps for user, users need to toggle off the kprobe hooks again in ksu manager if they want it disabled.
+	if (!ksu_is_su_kps_enabled()) {
+		ksu_sucompat_init();
+		ksu_su_compat_enabled = true;
+	}
+}
+
+void ksu_susfs_enable_sus_su(void) {
+	if (ksu_is_su_kps_enabled()) {
+		ksu_sucompat_exit();
+		ksu_su_compat_enabled = false;
+	}
+	susfs_is_sus_su_hooks_enabled = true;
+	ksu_devpts_hook = true;
+	susfs_sus_su_working_mode = SUS_SU_WITH_HOOKS;
+}
+#endif // #ifdef CONFIG_KSU_SUSFS_SUS_SU
+
